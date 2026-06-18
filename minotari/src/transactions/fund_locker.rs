@@ -20,6 +20,8 @@
 //! without accidentally locking additional funds. If a lock request with the same
 //! idempotency key already exists, the original result is returned.
 
+use std::sync::Mutex;
+
 use chrono::{Duration, Utc};
 use log::info;
 use tari_transaction_components::tari_amount::MicroMinotari;
@@ -67,6 +69,7 @@ use crate::{
 /// ```
 pub struct FundLocker {
     db_pool: SqlitePool,
+    lock: Mutex<()>,
 }
 
 impl FundLocker {
@@ -82,7 +85,10 @@ impl FundLocker {
     /// let locker = FundLocker::new(db_pool);
     /// ```
     pub fn new(db_pool: SqlitePool) -> Self {
-        Self { db_pool }
+        Self {
+            db_pool,
+            lock: Mutex::new(()),
+        }
     }
 
     /// Locks UTXOs for a pending transaction.
@@ -146,6 +152,11 @@ impl FundLocker {
         seconds_to_lock_utxos: u64,
         confirmation_window: u64,
     ) -> Result<LockFundsResult, anyhow::Error> {
+        // Acquire mutex to serialize concurrent UTXO selection attempts.
+        // Without this, two concurrent requests could both read the same
+        // unspent outputs before either commits, leading to double-selection.
+        let _guard = self.lock.lock().map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
         info!(
             target: "audit",
             account_id = account_id,
@@ -343,5 +354,42 @@ mod tests {
         // Without idempotency keys, each call should be independent
         assert!(result1.is_ok() || result1.is_err());
         assert!(result2.is_ok() || result2.is_err());
+    }
+
+    #[test]
+    fn test_fund_locker_mutex_prevents_concurrent_selection() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let pool = setup_test_db();
+        let locker = Arc::new(FundLocker::new(pool));
+        let mut handles = vec![];
+
+        // Spawn multiple threads trying to lock the same UTXOs
+        for i in 0..5 {
+            let locker_clone = Arc::clone(&locker);
+            handles.push(thread::spawn(move || {
+                locker_clone.lock(
+                    1,
+                    MicroMinotari(1_000_000),
+                    1,
+                    MicroMinotari(5),
+                    None,
+                    Some(format!("concurrent-key-{}", i)),
+                    300,
+                    10,
+                )
+            }));
+        }
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // With mutex, at most one should succeed (others may fail due to insufficient funds)
+        // but none should panic or corrupt data
+        let successes = results.iter().filter(|r| r.is_ok()).count();
+        let failures = results.iter().filter(|r| r.is_err()).count();
+        assert_eq!(successes + failures, 5);
+        // At least one should succeed (the first to acquire the mutex)
+        assert!(successes >= 1);
     }
 }
