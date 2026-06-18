@@ -154,11 +154,11 @@ impl FundLocker {
         );
         let mut conn = self.db_pool.get()?;
 
-        // Start the transaction FIRST to prevent race conditions.
-        // SQLite's transaction isolation ensures that once we begin,
-        // no other connection can see our uncommitted changes or select
-        // the same UTXOs until we commit or rollback.
-        let transaction = conn.transaction()?;
+        // Use IMMEDIATE transaction to acquire a RESERVE lock upfront.
+        // This prevents concurrent transactions from reading and selecting
+        // the same UTXOs. A DEFERRED transaction would only acquire a SHARED
+        // lock on reads, allowing race conditions.
+        let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         // Check idempotency INSIDE the transaction so concurrent requests
         // with the same key cannot both proceed past this point.
