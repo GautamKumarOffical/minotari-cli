@@ -152,6 +152,25 @@ impl FundLocker {
         seconds_to_lock_utxos: u64,
         confirmation_window: u64,
     ) -> Result<LockFundsResult, anyhow::Error> {
+        // Fast path: check idempotency without acquiring the mutex.
+        // This allows duplicate requests to return immediately without
+        // blocking other concurrent operations.
+        if let Some(idempotency_key_str) = &idempotency_key {
+            let conn = self.db_pool.get()?;
+            if let Some(response) = db::find_pending_transaction_locked_funds_by_idempotency_key(
+                &conn,
+                idempotency_key_str,
+                account_id,
+            )? {
+                info!(
+                    target: "audit",
+                    idempotency_key = idempotency_key_str.as_str();
+                    "Found existing pending transaction lock (fast path)"
+                );
+                return Ok(response);
+            }
+        }
+
         // Acquire mutex to serialize concurrent UTXO selection attempts.
         // Without this, two concurrent requests could both read the same
         // unspent outputs before either commits, leading to double-selection.
@@ -171,8 +190,9 @@ impl FundLocker {
         // lock on reads, allowing race conditions.
         let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
-        // Check idempotency INSIDE the transaction so concurrent requests
-        // with the same key cannot both proceed past this point.
+        // Re-check idempotency inside the mutex and transaction.
+        // Between the fast path check and acquiring the mutex, another thread
+        // may have created a lock with the same key.
         if let Some(idempotency_key_str) = &idempotency_key
             && let Some(response) = db::find_pending_transaction_locked_funds_by_idempotency_key(
                 &transaction,
@@ -183,7 +203,7 @@ impl FundLocker {
             info!(
                 target: "audit",
                 idempotency_key = idempotency_key_str.as_str();
-                "Found existing pending transaction lock"
+                "Found existing pending transaction lock (after mutex)"
             );
             transaction.rollback()?;
             return Ok(response);
